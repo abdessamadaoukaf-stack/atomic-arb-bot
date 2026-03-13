@@ -2,6 +2,7 @@ mod local_state;
 mod ws_tuned;
 
 use alloy::{
+    network::TransactionBuilder, // <-- FIX 2: Added the missing trait
     primitives::{address, Address, Bytes, U256},
     providers::{Provider, ProviderBuilder, RootProvider, WsConnect},
     transports::http::{Client, Http},
@@ -13,34 +14,33 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use eyre::Result;
 
-// --- 🛡️ UPDATED SMART CONTRACT INTERFACE ---
 sol! {
     interface ITriArb {
         function executeTriArb(
             address tokenIn,
             address tokenOut,
             uint256 amountIn,
-            uint256 minProfitOut, // SANDWICH PROTECTION
+            uint256 minProfitOut, 
             address poolA,
             address poolB
         ) external;
     }
 }
 
-// --- CONFIGURATION ---
 const IS_SIMULATION: bool = false; 
 const MIN_PROFIT_WEI: u128 = 5_000_000_000_000_000; // 0.005 ETH
-const MEV_CONTRACT: Address = address!("0x654d4AcE007F76986B59baE921457c86db27184A"); // <-- UPDATE THIS
-const MY_WALLET: Address = address!("0x14954a074cE69096937E7a30B956550787674796"); // <-- UPDATE THIS (Needed for eth_call)
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     
+    // --- FIX 1: Parse addresses at runtime to prevent macro panics from invisible characters ---
+    let mev_contract: Address = "0x654d4AcE007F76986B59baE921457c86db27184A".parse().expect("Invalid Contract Address");
+    let my_wallet: Address = "0x14954a074cE69096937E7a30B956550787674796".parse().expect("Invalid Wallet Address");
+
     let alchemy_ws = std::env::var("ALCHEMY_WS_URL").expect("Missing ALCHEMY_WS_URL");
     let amm_state = Arc::new(local_state::LocalAmmState::new());
 
-    // --- 🌐 RPC LOAD BALANCING (Anti-Throttling) ---
     let rpc_endpoints = vec![
         std::env::var("ALCHEMY_HTTP_URL").unwrap_or_default(),
         "https://mainnet.base.org".to_string(),
@@ -52,16 +52,15 @@ async fn main() -> Result<()> {
     for url in rpc_endpoints {
         if url.is_empty() { continue; }
         if let Ok(url_parsed) = url.parse() {
-            if let Ok(builder) = ProviderBuilder::new().on_http(url_parsed) {
-                println!("🔗 Connected to HTTP RPC: {}", url);
-                http_provider = Some(Arc::new(builder));
-                break;
-            }
+            // --- FIX 3: Removed `if let Ok` because on_http returns the builder directly ---
+            let builder = ProviderBuilder::new().on_http(url_parsed);
+            println!("🔗 Connected to HTTP RPC: {}", url);
+            http_provider = Some(Arc::new(builder));
+            break;
         }
     }
     let http_provider = http_provider.expect("FATAL: All HTTP RPC endpoints failed.");
 
-    // --- APEX REGISTRY: 40 BASE NETWORK POOLS ---
     let pools = vec![
         address!("d0b53D9277642d899DF5C87A3966A349A798F224"), // UniV3 0.05%
         address!("4c36388be6f416a29c8d8eee81c771ce6be14b18"), // Pancake V3
@@ -116,7 +115,7 @@ async fn main() -> Result<()> {
     let mut logs_stream = ws_tuned::subscribe_tuned_swap_logs(ws_logs, pools.clone()).await?;
 
     println!("🚀 APEX SNIPER LIVE | SIMULATION: {} | POOLS: {}", IS_SIMULATION, pools.len());
-    println!("🛡️ CONTRACT LOADED: {}", MEV_CONTRACT);
+    println!("🛡️ CONTRACT LOADED: {}", mev_contract);
 
     let state_handle = Arc::clone(&amm_state);
     tokio::spawn(async move {
@@ -128,7 +127,6 @@ async fn main() -> Result<()> {
     while let Some(block) = block_stream.next().await {
         let block_number = block.header.number.unwrap_or_default();
         
-        // --- 🔄 10-BLOCK AUTO-SYNC (Anti-Staleness) ---
         if block_number % 10 == 0 {
             println!("🔄 [SYNC] Block {} - Forcing hard state resync...", block_number);
             let _ = amm_state.seed_with_retry(&http_provider, pools.clone()).await;
@@ -136,11 +134,13 @@ async fn main() -> Result<()> {
 
         let state = Arc::clone(&amm_state);
         let pool_list = pools.clone();
-        let provider_clone = Arc::clone(&http_provider); // Pass the RPC provider to the evaluator
+        let provider_clone = Arc::clone(&http_provider); 
+        let mev_clone = mev_contract;
+        let wallet_clone = my_wallet;
         
         tokio::spawn(async move {
             let t0 = std::time::Instant::now();
-            let _ = evaluate_simulation(block_number, state, pool_list, provider_clone).await;
+            let _ = evaluate_simulation(block_number, state, pool_list, provider_clone, mev_clone, wallet_clone).await;
             println!("⚡ Block {} evaluated in {:.2}ms", block_number, t0.elapsed().as_secs_f64() * 1000.0);
         });
     }
@@ -151,7 +151,9 @@ async fn evaluate_simulation(
     block_number: u64, 
     state: Arc<local_state::LocalAmmState>, 
     pools: Vec<Address>,
-    provider: Arc<RootProvider<Http<Client>>> 
+    provider: Arc<RootProvider<Http<Client>>>,
+    mev_contract: Address,
+    my_wallet: Address
 ) -> Result<()> {
     for i in 0..pools.len() {
         for j in i+1..pools.len() {
@@ -182,31 +184,25 @@ async fn evaluate_simulation(
             if best_p > U256::from(MIN_PROFIT_WEI) {
                 let profit_eth = best_p.to_string().parse::<f64>().unwrap_or(0.0) / 1e18;
                 
-                // 1. Generate the Calldata WITH Sandwich Protection
                 let call = ITriArb::executeTriArbCall {
                     tokenIn: t0_a,
                     tokenOut: t1_a,
                     amountIn: optimal_trade_size,
-                    minProfitOut: best_p, // Require the exact math profit on-chain
+                    minProfitOut: best_p,
                     poolA: pools[i],
                     poolB: pools[j],
                 };
                 let calldata: Bytes = call.abi_encode().into();
 
-                // 2. Build the exact transaction Request
                 let tx_request = TransactionRequest::default()
-                    .to(MEV_CONTRACT)
-                    .from(MY_WALLET)
+                    .to(mev_contract)
+                    .from(my_wallet)
                     .with_input(calldata.clone());
 
-                // --- 🛡️ THE ETH_CALL SHIELD & DYNAMIC GAS ESTIMATOR ---
-                // We ask the node: "Will this fail?"
                 match provider.estimate_gas(&tx_request).await {
                     Ok(estimated_gas) => {
-                        // IT PASSED! We extract the exact dynamic gas needed
                         let gas_limit: u64 = estimated_gas as u64; 
 
-                        // 30% Bribe Math
                         let bribe = best_p * U256::from(3) / U256::from(10); 
                         let bribe_u128: u128 = bribe.try_into().unwrap_or(u128::MAX);
                         let mut max_priority_fee_per_gas: u128 = bribe_u128 / (gas_limit as u128);
@@ -221,13 +217,8 @@ async fn evaluate_simulation(
                         );
                         println!("{}", msg);
                         send_telegram_alert(msg);
-
-                        // If you are ready to fire real transactions, you uncomment the line below:
-                        // let _ = provider.send_transaction(tx_request.with_gas_limit(gas_limit).with_max_priority_fee_per_gas(max_priority_fee_per_gas)).await;
                     },
-                    Err(e) => {
-                        // The network rejected it! Slippage was too high, or tick math failed.
-                        // YOU JUST SAVED $0.02 IN REVERT FEES.
+                    Err(_) => {
                         println!("🔴 [SHIELD] Revert prevented on block {}. Math failed on-chain. Saved $0.02.", block_number);
                     }
                 }
