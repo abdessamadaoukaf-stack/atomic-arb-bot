@@ -23,7 +23,8 @@ jobs:
       - run: |
           git config --global user.name "Ghost-Sentinel-AI"
           git config --global user.email "bot@ghostsentinel.com"
-          git add ledger.json ai_brain.json || true
+          git add ledger.json || true
+          git add ai_brain.json || true
           git commit -m "Automated ledger update" || true
           git pull --rebase || true
           git push || true
