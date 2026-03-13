@@ -25,9 +25,9 @@ sol! {
 }
 
 // --- CONFIGURATION ---
-const IS_SIMULATION: bool = true; 
+const IS_SIMULATION: bool = false; 
 const MIN_PROFIT_WEI: u128 = 5_000_000_000_000_000; // 0.005 ETH
-const MEV_CONTRACT: Address = address!("820a3Ceb706681B6b14C279aaB9b4A9ab0A603e4");
+const MEV_CONTRACT: Address = address!("0x448EFa04e80339C4D7a3c5c6B93ef0fb4E5E3c8E");
 
 #[tokio::main]
 async fn main() -> Result<()> {
