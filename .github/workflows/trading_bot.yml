@@ -1,0 +1,29 @@
+name: Ghost Sentinel Hourly Trading Bot
+on:
+  schedule:
+    - cron: '2 * * * *'
+  workflow_dispatch:
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install pandas numpy scikit-learn scipy matplotlib yfinance requests mplfinance
+      - env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          JOURNAL_WEBHOOK: ${{ secrets.JOURNAL_WEBHOOK }}
+        run: python live_heartbeat.py
+      - run: |
+          git config --global user.name "Ghost-Sentinel-AI"
+          git config --global user.email "bot@ghostsentinel.com"
+          git add ledger.json ai_brain.json || true
+          git commit -m "Automated ledger update" || true
+          git pull --rebase || true
+          git push || true
