@@ -1,11 +1,5 @@
 {
-    "equity": 99762.456,
+    "equity": 99494.5104,
     "peak_equity": 100000.0,
-    "open_trade": {
-        "dir": "LONG",
-        "entry": 24489.75,
-        "sl": 24356.2772,
-        "tp": 24689.9592,
-        "qty": 1
-    }
+    "open_trade": null
 }
